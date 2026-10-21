@@ -6,6 +6,7 @@
 2. **测试环境基准配置：**
    * **硬件平台：** NVIDIA H100-SXM5-80GB，1 GPU。
    * **软件栈依赖：** Ubuntu 24.04.2 LTS, PyTorch 2.7, CUDA 12.9, TransformerEngine-FP8FlowMoe, Megatron-LM-FP8FlowMoe。
+   * **PAI平台镜像：** fp8-flow-moe-test-1020
 
 ---
 
