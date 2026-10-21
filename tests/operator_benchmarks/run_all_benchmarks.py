@@ -1,428 +1,134 @@
-#!/usr/bin/env python3
-"""
-FP8-FLOW-MoE Operator Benchmarks: One-click runner and report generator.
-
-Usage:
-    # Run single-GPU benchmarks and generate report
-    python run_all_benchmarks.py
-
-    # Also run intra-node FP8 communication benchmark (requires 8 GPUs)
-    python run_all_benchmarks.py --with-comm
-
-    # Only generate report from existing results without re-running benchmarks
-    python run_all_benchmarks.py --report-only
-
-Output:
-    - Per-benchmark perf_data.csv files in each sub-directory
-    - Summary report printed to console and saved to validation_report.txt
-
-Report strategy:
-    The script collects all speedup values from each benchmark's output CSV,
-    groups them by operation type, and compares against the expected
-    speedup range.  The report presents the comparison clearly so that AE
-    reviewers can evaluate the results.  No hard PASS/FAIL judgement is made;
-    the final assessment is left to the reviewers.
-"""
-
-import argparse
-import csv
 import os
-import subprocess
 import sys
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+import subprocess
+import time
+from datetime import datetime
+import shutil
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+import pathlib
 
-# ---------------------------------------------------------------------------
-# Benchmark definitions
-# ---------------------------------------------------------------------------
-# Each benchmark defines:
-#   speedup_groups: dict mapping group_name -> {
-#       "columns": list of CSV column names belonging to this group,
-#       "expect_range": (min_speedup, max_speedup) expected range,
-#       "description": short description for the report
-#   }
-#   expected_csv: path to expected output CSV (relative to subdir)
+# 在 main() 函数开头加入清理逻辑
+def clean_pycache(root_dir):
+    """清理所有 __pycache__ 目录，防止缓存干扰第三方验收"""
+    count = 0
+    for p in pathlib.Path(root_dir).rglob("__pycache__"):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            count += 1
+    if count > 0:
+        print(f"🧹 Cleaned up {count} __pycache__ directories.")
 
-SINGLE_GPU_BENCHMARKS = [
-    {
-        "name": "Fused Permute and Padding",
-        "section": "Section 4.4.1",
-        "subdir": "fused_permute_and_padding",
-        "run_cmd": [sys.executable, "bench.py"],
-        "output_csv": "perf_data.csv",
-        "expected_csv": "expected_output/perf_data_expected.csv",
-        "speedup_groups": {
-            "perm_pad": {
-                "columns": ["bf16_perm_pad_speedup", "fp8_perm_pad_speedup"],
-                "expect_range": (0.76, 1.70),
-                "description": "permute+padding speedup (BF16 & FP8)",
-            },
-            "unperm_unpad": {
-                "columns": ["bf16_unperm_unpad_speedup", "fp8_unperm_unpad_speedup"],
-                "expect_range": (4.24, 7.33),
-                "description": "unpermute+unpadding speedup (BF16 & FP8)",
-            },
-        },
-    },
-    {
-        "name": "Fused SwiGLU and Quantization",
-        "section": "Section 4.4.3",
-        "subdir": "fused_swiglu_and_quantization",
-        "run_cmd": [sys.executable, "bench.py"],
-        "output_csv": "perf_data.csv",
-        "expected_csv": "expected_output/perf_data_expected.csv",
-        "speedup_groups": {
-            "fwd": {
-                "columns": ["fwd_speedup"],
-                "expect_range": (1.69, 2.18),
-                "description": "Forward fused SwiGLU+Quant speedup",
-            },
-            "bwd": {
-                "columns": ["bwd_speedup"],
-                "expect_range": (2.56, 4.01),
-                "description": "Backward fused SwiGLU+Quant speedup",
-            },
-        },
-    },
-    {
-        "name": "Scaling-aware FP8 Transpose",
-        "section": "Section 4.4.4",
-        "subdir": "scaling_aware_fp8_transpose",
-        "run_cmd": [sys.executable, "bench.py"],
-        "output_csv": "perf_data.csv",
-        "expected_csv": "expected_output/perf_data_expected.csv",
-        "speedup_groups": {
-            "transpose": {
-                "columns": ["speedup"],
-                "expect_range": (2.3, 3.06),
-                "description": "Scaling-aware FP8 transpose speedup",
-            },
-        },
-    },
-]
-
-COMM_BENCHMARK_INTRANODE = {
-    "name": "FP8 Communication (intra-node, EP=8)",
-    "section": "Section 4.4.2",
-    "subdir": "fp8_communication",
-    "run_cmd": [sys.executable, "bench_intranode.py"],
-    "output_csv": "perf_data_intranode_ep8.csv",
-    "expected_csv": "expected_output/perf_data_intranode_ep8_expected.csv",
-    "speedup_groups": {
-        "comm": {
-            "columns": ["speedup_comm"],
-            "expect_range": (1.4, 1.65),
-            "description": "FP8 communication-only speedup",
-        },
-        "overall": {
-            "columns": ["speedup_all"],
-            "expect_range": (1.0, 1.18),
-            "description": "FP8 overall (comm+quant+dequant) speedup",
-        },
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# CSV helpers
-# ---------------------------------------------------------------------------
-def read_csv_rows(csv_path: str) -> Tuple[List[str], List[dict]]:
-    """Read CSV and return (header, list-of-row-dicts)."""
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        header = reader.fieldnames or []
-        rows = list(reader)
-    return header, rows
-
-
-def build_expected_lookup(csv_path: str, speedup_columns: List[str]) -> Dict[Tuple[str, str], float]:
-    """Build a lookup dict: (config, column) -> expected speedup value."""
-    lookup = {}
-    if not os.path.exists(csv_path):
-        return lookup
-    _, rows = read_csv_rows(csv_path)
-    for row_idx, row in enumerate(rows):
-        config_str = row.get("config", f"row_{row_idx}")
-        for col in speedup_columns:
-            if col in row:
-                try:
-                    lookup[(config_str, col)] = float(row[col])
-                except (ValueError, TypeError):
-                    pass
-    return lookup
-
-
-# ---------------------------------------------------------------------------
-# Result collection
-# ---------------------------------------------------------------------------
-@dataclass
-class ValueEntry:
-    """A single speedup measurement."""
-    config: str
-    column: str
-    actual: float
-    expect: Optional[float]  # from expected CSV, None if not available
-
-
-@dataclass
-class GroupResult:
-    """Collected results for one speedup group across all configs."""
-    group_name: str
-    description: str
-    expect_range: Tuple[float, float]  # (min, max) expected range
-    entries: List[ValueEntry]
-
-
-@dataclass
-class BenchmarkReport:
-    name: str
-    section: str
-    run_success: bool
-    run_error: str = ""
-    group_results: List[GroupResult] = field(default_factory=list)
-
-
-def collect_results(bench: dict) -> BenchmarkReport:
-    """Collect speedup values from benchmark output CSV and expected CSV."""
-    report = BenchmarkReport(
-        name=bench["name"], section=bench["section"], run_success=True
-    )
-
-    subdir = os.path.join(SCRIPT_DIR, bench["subdir"])
-    actual_path = os.path.join(subdir, bench["output_csv"])
-
-    if not os.path.exists(actual_path):
-        report.run_success = False
-        report.run_error = f"Output CSV not found: {actual_path}"
-        return report
-
-    _, actual_rows = read_csv_rows(actual_path)
-
-    if len(actual_rows) == 0:
-        report.run_success = False
-        report.run_error = "Output CSV has no data rows"
-        return report
-
-    # Collect all speedup columns across groups for expected lookup
-    all_speedup_cols = []
-    for group_def in bench["speedup_groups"].values():
-        all_speedup_cols.extend(group_def["columns"])
-
-    # Build expected lookup from expected CSV
-    expected_path = os.path.join(subdir, bench.get("expected_csv", ""))
-    expected_lookup = build_expected_lookup(expected_path, all_speedup_cols)
-
-    for group_name, group_def in bench["speedup_groups"].items():
-        columns = group_def["columns"]
-        expect_range = group_def["expect_range"]
-        description = group_def["description"]
-
-        entries = []
-        for row_idx, row in enumerate(actual_rows):
-            config_str = row.get("config", f"row_{row_idx}")
-            for col in columns:
-                if col not in row:
-                    continue
-                actual_val = float(row[col])
-                expect_val = expected_lookup.get((config_str, col))
-                entries.append(ValueEntry(
-                    config=config_str,
-                    column=col,
-                    actual=actual_val,
-                    expect=expect_val,
-                ))
-
-        report.group_results.append(
-            GroupResult(
-                group_name=group_name,
-                description=description,
-                expect_range=expect_range,
-                entries=entries,
-            )
-        )
-
-    return report
-
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-def run_benchmark(bench: dict) -> Tuple[bool, str]:
-    """Run a single benchmark with real-time output. Returns (success, error_message)."""
-    subdir = os.path.join(SCRIPT_DIR, bench["subdir"])
-    cmd = bench["run_cmd"]
-    print(f"  Command: {' '.join(cmd)}")
-    print(f"  Working dir: {subdir}")
-    print(flush=True)
-
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=subdir,
-            timeout=1800,  # 30 min timeout per benchmark
-        )
-        if result.returncode != 0:
-            return False, f"Exit code {result.returncode}"
-        return True, ""
-    except subprocess.TimeoutExpired:
-        return False, "Benchmark timed out (30 min)"
-    except Exception as e:
-        return False, str(e)
-
-
-# ---------------------------------------------------------------------------
-# Report formatting
-# ---------------------------------------------------------------------------
-def format_report(reports: List[BenchmarkReport]) -> str:
-    lines = []
-    lines.append("=" * 80)
-    lines.append("FP8-FLOW-MoE Operator Benchmarks — Results Report")
-    lines.append("=" * 80)
-
-    for report in reports:
-        lines.append("")
-        lines.append(f"  {report.name} ({report.section})")
-        lines.append("-" * 80)
-
-        if not report.run_success:
-            lines.append(f"  ERROR: {report.run_error}")
-            continue
-
-        for g in report.group_results:
-            actual_vals = [e.actual for e in g.entries]
-            if actual_vals:
-                actual_range_str = f"[{min(actual_vals):.2f}x, {max(actual_vals):.2f}x]"
-            else:
-                actual_range_str = "no data"
-
-            expect_range_str = f"[{g.expect_range[0]:.2f}x, {g.expect_range[1]:.2f}x]"
-
-            lines.append(
-                f"  {g.description}"
-                f"  |  Actual: {actual_range_str}"
-                f"  Expect: {expect_range_str}"
-            )
-            lines.append("")
-
-            # Table header
-            lines.append(
-                f"      {'Config':<35s}  {'Item':<30s}  {'Actual':>10s}  {'Expect':>10s}"
-            )
-            lines.append(
-                f"      {'-'*35}  {'-'*30}  {'-'*10}  {'-'*10}"
-            )
-
-            # Table rows
-            for e in g.entries:
-                expect_str = f"{e.expect:.2f}x" if e.expect is not None else "N/A"
-                lines.append(
-                    f"      {e.config:<35s}  {e.column:<30s}  {e.actual:>9.2f}x  {expect_str:>10s}"
-                )
-
-            lines.append("")
-
-    lines.append("=" * 80)
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run all FP8-FLOW-MoE operator benchmarks and generate comparison report."
-    )
-    parser.add_argument(
-        "--with-comm",
-        action="store_true",
-        help="Also run FP8 communication intra-node benchmark (requires 8 GPUs)",
-    )
-    parser.add_argument(
-        "--report-only",
-        action="store_true",
-        help="Skip running benchmarks; only generate report from existing perf_data.csv files",
-    )
-    parser.add_argument(
-        "--report-file",
-        type=str,
-        default=os.path.join(SCRIPT_DIR, "validation_report.txt"),
-        help="Path to save the report (default: validation_report.txt)",
-    )
-    args = parser.parse_args()
+    current_dir = os.path.dirname(os.path.abspath(__file__))
 
-    benchmarks = list(SINGLE_GPU_BENCHMARKS)
-    if args.with_comm:
-        benchmarks.append(COMM_BENCHMARK_INTRANODE)
+    # ---> 启动时自动清理 <---
+    clean_pycache(current_dir)
+    
+    # 1. 获取项目根目录 (向上退两级)
+    project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+    
+    env = os.environ.copy()
+    env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7" # 按需修改
 
-    # --- Clean up previous output files ---
-    # Always remove old report file
-    if os.path.exists(args.report_file):
-        os.remove(args.report_file)
-        print(f"Removed old report: {args.report_file}")
+    # 2. 创建归档目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_dir = os.path.join(current_dir, f"bench_results_{timestamp}")
+    os.makedirs(result_dir, exist_ok=True)
 
-    # Remove old perf_data.csv files (skip when --report-only)
-    if not args.report_only:
-        for bench in benchmarks:
-            csv_path = os.path.join(SCRIPT_DIR, bench["subdir"], bench["output_csv"])
-            if os.path.exists(csv_path):
-                os.remove(csv_path)
-                print(f"Removed old output: {csv_path}")
+    print("==========================================================")
+    print("Starting FP8-FLOW-MOE Performance Benchmarks...")
+    print(f"Results will be archived to: {result_dir}")
+    print("==========================================================")
 
-    reports: List[BenchmarkReport] = []
+    # 3. 收集所有 bench.py 脚本路径
+    bench_scripts = []
+    for root, dirs, files in os.walk(current_dir):
+        if "bench.py" in files:
+            # 排除根目录下可能存在的 benchmark_csv.py 等
+            script_path = os.path.join(root, "bench.py")
+            bench_scripts.append(script_path)
 
-    print("")
-    print("=" * 80)
-    print("FP8-FLOW-MoE Operator Benchmarks")
-    print(f"Benchmarks to run: {len(benchmarks)}")
-    print("=" * 80)
+    bench_scripts.sort() # 排序，保证每次执行顺序一致
+    total_scripts = len(bench_scripts)
+    print(f"Found {total_scripts} benchmark scripts to execute.\n")
 
-    for i, bench in enumerate(benchmarks, 1):
-        print(f"\n[{i}/{len(benchmarks)}] {bench['name']} ({bench['section']})")
-        print("-" * 60)
+    failed_scripts = []
 
-        # --- Run ---
-        if not args.report_only:
-            print("  Running benchmark ...")
-            success, error = run_benchmark(bench)
-            if success:
-                print("  Benchmark completed successfully.")
+    # 4. 顺序执行每一个 bench.py
+    for idx, script_path in enumerate(bench_scripts, 1):
+        op_name = os.path.basename(os.path.dirname(script_path))
+        print(f"----------------------------------------------------------")
+        print(f"[{idx}/{total_scripts}] Running benchmark for: {op_name}")
+        print(f"Script: {script_path}")
+        print(f"----------------------------------------------------------")
+
+        start_time = time.time()
+        
+        # 切换工作目录到算子目录，确保生成的 perf_data.csv 直接落在对应目录下
+        work_dir = os.path.dirname(script_path)
+        
+        try:
+            # 实时打印输出
+            process = subprocess.Popen(
+                [sys.executable, "bench.py"],
+                cwd=work_dir,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            
+            for line in process.stdout:
+                print(line, end="")
+            
+            process.wait()
+            
+            if process.returncode != 0:
+                print(f"❌ Error: Benchmark for {op_name} failed with return code {process.returncode}")
+                failed_scripts.append(op_name)
             else:
-                print(f"  Benchmark FAILED: {error[:200]}")
-                reports.append(
-                    BenchmarkReport(
-                        name=bench["name"],
-                        section=bench["section"],
-                        run_success=False,
-                        run_error=error,
-                    )
-                )
-                continue
+                elapsed = time.time() - start_time
+                print(f"✅ Finished {op_name} in {elapsed:.2f}s")
+                
+                # 5. 收集产物 (将生成的 csv 复制到归档目录)
+                # 您的脚本可能生成 perf_data.csv 或 bench_results.csv
+                for out_file in ["perf_data.csv", "bench_results.csv"]:
+                    src_file = os.path.join(work_dir, out_file)
+                    if os.path.exists(src_file):
+                        dst_file = os.path.join(result_dir, f"{op_name}_{out_file}")
+                        shutil.copy2(src_file, dst_file)
+                        print(f"   -> Saved {out_file} to archive.")
 
-        # --- Collect results ---
-        print("  Collecting results ...")
-        report = collect_results(bench)
-        reports.append(report)
+        except Exception as e:
+            print(f"❌ Exception running {op_name}: {e}")
+            failed_scripts.append(op_name)
+            
+        # 清理显存，防止下一个算子 OOM
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+            
+        time.sleep(2) # 稍微停顿，让 GPU 散热/冷却，保证下一个性能测试准确
 
-        if report.run_success:
-            n_values = sum(len(g.entries) for g in report.group_results)
-            print(f"  Collected {n_values} speedup values across {len(report.group_results)} groups")
-        else:
-            print(f"  ERROR: {report.run_error}")
-
-    # --- Final report ---
-    report_text = format_report(reports)
-    print("\n")
-    print(report_text)
-
-    with open(args.report_file, "w") as f:
-        f.write(report_text)
-    print(f"\nReport saved to: {args.report_file}")
-
-    sys.exit(0)
-
+    # 6. 汇总报告
+    print("\n==========================================================")
+    print("Benchmark Execution Summary:")
+    print(f"Total Scripts: {total_scripts}")
+    print(f"Passed: {total_scripts - len(failed_scripts)}")
+    print(f"Failed: {len(failed_scripts)}")
+    
+    if failed_scripts:
+        print("\nFailed Operators:")
+        for f in failed_scripts:
+            print(f" - {f}")
+        sys.exit(1)
+    else:
+        print(f"\n🎉 ALL BENCHMARKS PASSED! Check results in: {result_dir}")
+        sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

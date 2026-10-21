@@ -24,7 +24,7 @@ def perf_test_cuda_kernel(cuda_kernel_fn):
         end_event = torch.cuda.Event(enable_timing=True)
 
         # warmup
-        for _ in range(50):
+        for _ in range(20):
             cuda_kernel_fn()
 
         start_event.record()

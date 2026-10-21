@@ -1,388 +1,112 @@
-[ [Back to index](https://cTuning.org/ae) ]
+# 高性能算子交付测试说明
 
-# Artifact Checklist for FP8-FLOW-MOE
+## 一、交付概览
 
-## Abstract
-
-This artifact accompanies the paper **FP8-FLOW-MOE: A CASTING-FREE FP8 RECIPE WITHOUT DOUBLE QUANTIZATION ERROR**. The artifact includes:
-
-**The artifact is organized into three repositories**:
-- **Modified TransformerEngine** — with fused FP8-aware operators and FP8-FLOW-MOE pipeline support.
-- **Modified Megatron-LM** — integrating the FP8-FLOW-MOE training pipeline, fused FP8-aware operators, and fine-grained recomputation for `moe_expert`.
-- **FP8-FLOW-MOE test suite** — benchmark scripts and expected-result checks for reproducing the paper’s experiments.
-
-**Minimum hardware:** 
-- NVIDIA Hopper GPUs (FP8-capable; larger HBM capacity recommended). 
-- Operator micro-benchmarks require 1 GPU or 32 GPUS; 
-- End-to-end efficiency/ablation/convergence experiments are designed for up to 32 nodes (256 GPUs).
-
-**Key results to reproduce:**
-- Convergence validation showing no loss degradation under FP8 training (Section 4.1).
-- End-to-end training efficiency improvements on DeepSeek-V3/V2 and Qwen3-235B models (Section 4.2).
-- End-to-end component ablations, using the same setup as Section 4.2 with full activation checkpointing (Section 4.3).
-- Operator-level speedups for fused permute-and-padding, fused SwiGLU+quantization, scaling-aware FP8 transpose, and FP8 communication (Section 4.4).
+1. **交付范围：** 本次共交付高精度、高性能算子共 13 个，包含 10 个 FP8 低精度算子和 3 个融合算子，涵盖核心计算、MoE 路由分发、激活函数及量化加速等底层核心场景。
+2. **测试环境基准配置：**
+   * **硬件平台：** NVIDIA H100-SXM5-80GB，1 GPU。
+   * **软件栈依赖：** Ubuntu 24.04.2 LTS, PyTorch 2.7, CUDA 12.9, TransformerEngine-FP8FlowMoe, Megatron-LM-FP8FlowMoe。
 
 ---
 
-## Checklist
+## 二、算子清单
 
-* **Algorithm:** Yes. FP8-FLOW-MOE is an end-to-end FP8 mixed-precision training framework for MoE models, including fused operators and FP8 communication strategies.
-* **Program:** Modified TransformerEngine, modified Megatron-LM, and custom benchmark/launcher scripts (Python and shell). All scripts needed for the reported benchmarks are included in this artifact.
-* **Compilation:** TransformerEngine must be compiled from source (requires CUDA toolkit).
-* **Model:** DeepSeek-V3/V2 and Qwen3-235B model configurations are used for end-to-end evaluation. Model weights are publicly available on HuggingFace and must be converted to Megatron-Core format (see [Models](#models) section for download and conversion instructions).
-* **Data set:** The paper used curated internal training datasets; due to their large size, they cannot be publicly hosted.
-* **Run-time environment:** Linux (tested on Ubuntu 24.04.2 LTS). Requires CUDA 12.9+, PyTorch, Triton 3.2.0, DeepEP 1.0.0.5. No root access is required to run the experiments after dependencies are installed.
-* **Hardware:** NVIDIA Hopper GPUs. Intra-node: NVLink; inter-node: RoCE.
-  - Operator micro-benchmarks: 1 GPU.
-  - FP8 communication micro-benchmarks: 1–4 nodes (8 GPUs/node).
-  - End-to-end convergence/efficiency/ablation experiments: designed for multi-node (up to 32 nodes/256 GPUs depending on EP/PP settings).
-* **Run-time state:** Micro-benchmarks include warm-up iterations before timing to reduce cold-cache effects. Results may vary due to GPU thermal state and system load.
-* **Execution:** Sole-user access during benchmarking is recommended. No special process pinning required. Operator benchmarks complete in minutes; end-to-end experiments can take hours per configuration at scale.
-* **Metrics:** Kernel execution time (ms), speedup ratio (fused vs baseline), training throughput (TGS: tokens/GPU/s), peak GPU memory (GB/GPU), convergence loss curves.
-* **Output:**  
-  - Operator micro-benchmarks output CSV files (`perf_data*.csv`), console logs, and optional PDF plots; expected-result checks are included (e.g., aggregated reports).  
-  - End-to-end experiments output Megatron training logs; throughput is read from logs; peak memory is measured externally.
-* **Experiments:** We provide step-by-step reproduction instructions in the repository `https://github.com/021ai/FP8-FLOW-MOE-AE.git` (see `README.md`).
-* **How much disk space required (approximately)?:** ~5-10 GB for source code + build artifacts (Megatron-LM + TransformerEngine + tests). End-to-end experiments require additional disk space for datasets and checkpoints (varies by model/dataset).
-* **How much time is needed to prepare workflow (approximately)?:** ~2 hours for cloning repos and compiling/installing TransformerEngine (excluding large dataset/checkpoint downloads).
-* **How much time is needed to complete experiments (approximately)?:** Operator benchmarks ~1 hour total; end-to-end experiments are several hours per configuration (and depend on cluster scale).
-<!-- * **Workflow frameworks used?** No special workflow framework; standard Python scripts and shell scripts. -->
+| 序号 | 算子名称 (Op Name) | 核心功能简述 |
+| :--- | :--- | :--- |
+| 1 | `act_dequant_B_ptr` | 根据内存排布为行优先的缩放因子，将 bf16 格式的张量反向化为 fp8 格式 |
+| 2 | `act_dequant_noT_stride_B_ptr` | 根据内存排布为列优先的缩放因子，将 bf16 格式的张量反向化为 fp8 格式 |
+| 3 | `act_dequant_T_nostride_B_ptr` | 根据内存排布为行优先且经过转置的缩放因子，将 bf16 格式的张量反向化为 fp8 格式 |
+| 4 | `act_quant_B_ptr` | 对输入的 bf16 格式张量进行分组量化，得到 fp8 格式张量 |
+| 5 | `act_quant_tma_aligned_b_ptr` | 对输入的 bf16 格式张量进行分组量化，得到 fp8 格式张量，且确保缩放因子与 TMA 对齐 |
+| 6 | `weight_multi_cast_transpose_fused` | 执行逐块量化操作，将多个二维张量堆叠得到的三维张量，量化为 FP8 格式的三维张量 |
+| 7 | `weight_multi_cast_transpose_fused_2d_3d` | 执行逐块量化操作，将多个二维张量拼接得到的二维张量，量化为 FP8 格式的三维张量 |
+| 8 | `fused_swiglu_and_quantization_fwd` | 激活函数和量化操作融合前向算子 |
+| 9 | `fused_swiglu_and_quantization_bwd` | 激活函数和量化操作融合反向算子 |
+| 10 | `fused_permute_and_padding_fwd` | Token 重排和元素补齐操作融合前向算子 |
+| 11 | `fused_permute_and_padding_bwd` | Token 重排和元素补齐操作融合反向算子 |
+| 12 | `scaling_aware_fp8_transpose` | 反量化、转置和量化操作融合算子 |
+| 13 | `act_multi_cast_transpose_fp8` | 根据 `m_splits` 对输入张量进行逻辑分割，在每个子块上执行转置和 FP8 量化 |
 
 ---
 
-## Description
+## 三、验收测试维度与指标定义
 
-### How to access
+### 1. 正确性验证
+为保障算子的数学精度与工程可用性，本测试采用全局相似度误差和逐元素容差两个指标作为正确性判定的依据。由于不同的算子存在功能和原理上的差异，13 个算子的正确性判定标准有所区别，具体可参考各算子的测试脚本。两个指标的含义分别如下：
 
-**Option 1 (Recommended): Clone our pre-integrated repositories**
+#### 1.1 指标 1：全局相似度误差
+* 该指标反映了算子输出与基准参考输出之间的全局向量夹角/余弦相似度偏差。
+* **计算公式：** $\text{diff} = 1 - \frac{2 \sum (x \cdot y)}{\sum (x^2 + y^2)}$
+* **判定阈值：** $\text{diff} < 0.001$，即全局误差容忍度小于 $0.1\%$。
+* **判定意义：** 该指标能够有效卡住整体的宏观精度，防止因缩放因子应用错误（如整体少乘或多乘一个 Scale）导致的系统性精度崩塌，符合大模型对 FP8 反量化的极高精度要求。
 
-> **Strongly recommended:** please clone our *pre-integrated* repositories directly. They include our integrated end-to-end test launchers and the component-ablation implementations validated in our environment.
+#### 1.2 指标 2：逐元素双阈值容差
+* 该指标使用 PyTorch 原生 `torch.allclose` 函数进行逐元素比对，采用绝对误差 (`atol`) 与相对误差 (`rtol`) 混合判定。
+* **判定意义：** 满足公式 $|y - y_{\text{ref}}| \le \text{atol} + \text{rtol} \times |y_{\text{ref}}|$。该指标用于捕捉极值点（Outliers）、离群点或因边界对齐（Padding）导致的小范围溢出/截断错误。
 
+### 2. 性能验证
+为全面评估算子性能，测试时参考以下两个维度的指标：
+
+#### 2.1 Kernel 纯计算耗时 (Kernel Latency)
+* **定义：** 剥离 Python 开销和显存分配开销，纯计算核心在 GPU 上的执行时间。
+* **测量方法：** 使用基于 GPU Event 的 `do_bench` 工具，重复执行 100 次。记录并提取中位数（Median, $50\%$）、高水位线（$80\%$）和低水位线（$20\%$）的分位数，以消除系统噪声。
+
+#### 2.2 加速比要求 (Speedup Ratio)
+* **定义：** 被测算子相对于基准（TE）的耗时缩减倍数，即 Kernel 纯计算加速比。
+* **计算公式：** $\text{Speedup} = \frac{\text{Time}_{\text{TE}}}{\text{Time}_{\text{Triton}}}$。数值大于 1 表示被测算子性能优于 TE 基准。
+
+---
+
+## 四、测试执行流程
+
+### 1. 环境准备
+所有依赖包均安装完毕，直接进入测试目录：
 ```bash
-# Megatron-LM with FP8-FLOW-MOE patches
-git clone --recursive https://github.com/021ai/Megatron-LM-FP8FlowMoe.git
-
-# TransformerEngine with FP8-FLOW-MOE patches
-git clone --recursive https://github.com/021ai/TransformerEngine-FP8FlowMoe.git
-
-# Test scripts and benchmarks
-git clone https://github.com/021ai/FP8-FLOW-MOE-AE.git
+cd $TEST_PATH/
 ```
 
-**Option 2: Apply upstream PRs to official repositories**
-
-- **Megatron-LM (official repo):** https://github.com/NVIDIA/Megatron-LM  
-  - Megatron-LM base commit: `4af25fe`
-  - Our PRs to apply:
-    - https://github.com/NVIDIA/Megatron-LM/pull/2763
-    - https://github.com/NVIDIA/Megatron-LM/pull/2764
-
-- **TransformerEngine (official repo):** https://github.com/NVIDIA/TransformerEngine  
-  - TransformerEngine base commit: `40c69e7` (from release_v2.8)
-  - Our PRs to apply:
-    - https://github.com/NVIDIA/TransformerEngine/pull/1921
-    - https://github.com/NVIDIA/TransformerEngine/pull/2547
-    - https://github.com/NVIDIA/TransformerEngine/pull/2144
-
-- **FP8-FLOW-MOE test scripts (our repo):**
-  ```bash
-  git clone https://github.com/021ai/FP8-FLOW-MOE-AE.git
-  ```
----
-
-### Hardware dependencies
-
-- **GPU:** NVIDIA Hopper (FP8-capable; larger HBM capacity recommended)
-- **Intra-node interconnect:** NVLink
-- **Inter-node interconnect:** RoCE, Mellanox ConnectX (mlx5)
-
-**Minimum requirements by experiment:**
-
-| Experiment | GPUs Required |
-|---|---|
-| Convergence validation (Section 4.1) | Multi-node at scale (up to 30 nodes / 240 GPUs) |
-| End-to-end efficiency evaluation (Section 4.2) | Multi-node at scale (up to 32 nodes / 256 GPUs depending on EP/PP settings) |
-| End-to-end component ablations (Section 4.3) | Same setup as Section 4.2 |
-| Operator micro-benchmarks: fused kernels (Section 4.4.1/4.4.3/4.4.4) | 1 GPU |
-| Operator micro-benchmarks: FP8 communication  (Section 4.4.2) | EP8: 1 node (8 GPUs); EP16: 2 nodes (16 GPUs); EP32: 4 nodes (32 GPUs) |
-
----
-
-### Software dependencies
-
-| Software | Version (tested) | Notes |
-|---|---:|---|
-| OS | Ubuntu 24.04.2 LTS | Other modern Linux distros should also work |
-| CUDA Toolkit | 12.9.41 | Tested version |
-| PyTorch | 2.7.0a0+79aa17489c.nv25.04 | Tested with NVIDIA NGC nightly build |
-| Triton | 3.2.0 | Typically installed alongside PyTorch |
-| DeepEP | 1.0.0.5+6519814 | https://github.com/deepseek-ai/DeepEP.git (1.2.1+b57e5e2 also tested), need NVSHMEM support |
-| NCCL | CUDA 12.x compatible | For multi-GPU / multi-node comm |
-
----
-
-### Data sets
-
-- **Operator micro-benchmarks:** No external datasets required.
-- **End-to-end experiments (Sections 4.1–4.3):** If real data is not available, **mock data** can be used as a drop-in replacement for functional AE evaluation, but not for reproducing the paper’s convergence or efficiency numbers.
-
----
-
-### Models
-
-Reviewers can obtain checkpoints by downloading from HuggingFace and converting to Megatron-Core `torch_dist` format as described below. Which can be very large for the large-scale models above. Reviewers may use only the model(s) needed for the specific experiment they plan to reproduce.
-
-| Model | HuggingFace source | Used in |
-|---|---|---|
-| DeepSeek-V3-0324 (671B) | [deepseek-ai/DeepSeek-V3-0324](https://huggingface.co/deepseek-ai/DeepSeek-V3-0324) | Section 4.2 (e2e efficiency), Section 4.3 (ablations) |
-| DeepSeek-V2 (236B) | [deepseek-ai/DeepSeek-V2](https://huggingface.co/deepseek-ai/DeepSeek-V2) | Section 4.2 (e2e efficiency) |
-| Qwen3-235B-A22B | [Qwen/Qwen3-235B-A22B](https://huggingface.co/Qwen/Qwen3-235B-A22B) | Section 4.2 (e2e efficiency) |
-| DeepSeek-V2-Lite (16B) | [deepseek-ai/DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) |  Section 4.1  (convergence_validation) and Single-node smoke tests |
-
-
-## Installation
-
-```bash
-# 1. Create and enter working directory
-export FP8FLOWMOE_PATH=/your/path/to
-mkdir -p $FP8FLOWMOE_PATH/
-cd $FP8FLOWMOE_PATH/
-
-# 2. Clone repositories
-git clone --recursive https://github.com/021ai/Megatron-LM-FP8FlowMoe.git
-git clone --recursive https://github.com/021ai/TransformerEngine-FP8FlowMoe.git
-git clone https://github.com/021ai/FP8-FLOW-MOE-AE.git
-
-# 3. Install TransformerEngine from source
-pip uninstall -y transformer_engine  # remove any existing installation
-cd $FP8FLOWMOE_PATH/TransformerEngine-FP8FlowMoe
-export NVTE_FRAMEWORK=pytorch
-pip3 install --no-build-isolation .
-
-# 4. Set Megatron-LM/megatron env
-export PYTHONPATH=$FP8FLOWMOE_PATH/Megatron-LM-FP8FlowMoe:$PYTHONPATH
-```
-
----
-
-## Experiment workflow
-
-This artifact provides four groups of experiments under `FP8-FLOW-MOE-AE/tests/`, each corresponding to one experimental section in the paper:
-
+### 2. 实验执行
+测试目录结构如下：
 ```text
 tests/
-├── convergence_validation/       # Section 4.1: Convergence validation (loss via TensorBoard)
-├── e2e_efficiency_evaluation/    # Section 4.2: End-to-end efficiency (TGS & peak memory)
-├── e2e_component_ablations/      # Section 4.3: End-to-end ablations (TGS & peak memory)
-└── operator_benchmarks/          # Section 4.4: Operator-level micro-benchmarks
-    ├── fused_permute_and_padding/
-    ├── fp8_communication/
-    ├── fused_swiglu_and_quantization/
-    └── scaling_aware_fp8_transpose/
+├── operator_benchmarks/          # 算子性能测试，包含13个算子各自的测试目录
+│   ├── act_dequant_B_ptr/
+│   ├── act_dequant_noT_stride_B_ptr/
+│   ├── ……
+│   └── run_all_benchmarks.py          # 性能一键测试脚本
+└── operator_correctness/          # 算子正确性测试
+    ├── act_dequant_B_ptr/
+    ├── act_dequant_noT_stride_B_ptr/
+    ├── ……
+    └── run_all_tests.py          # 正确性一键测试脚本
 ```
 
-### Common workflow stages (applies to all experiments)
+所有算子支持一键测试和各算子独立测试两种模式，测试命令分别如下：
 
-1. **Environment preparation**
-   - Install/compile dependencies (TransformerEngine-FP8FlowMoe, Megatron-LM-FP8FlowMoe).
-   - Ensure DeepEP/CUDA/NCCL/NVSHMEM are correctly configured for your cluster.
-2. **Experiment execution**
-   - Run the corresponding launcher script (`.sh`) or benchmark script (`bench.py`, `bench_intranode.py`, ...).
-3. **Result collection**
-   - Operator micro-benchmarks generate `perf_data*.csv` and an aggregated report (e.g., `validation_report.txt`).
-   - End-to-end runs produce Megatron training logs under `${OUTPUT_DIR}` (configured in each launcher).
-   - Convergence validation writes TensorBoard event files under the run output directory (see Group A below).
+* **一键测试**
+  ```bash
+  # 正确性测试
+  cd tests/operator_correctness
+  python run_all_tests.py
 
+  # 性能测试
+  cd tests/operator_benchmarks
+  python run_all_benchmarks.py
+  ```
 
-### Experiment group A: Convergence validation (Section 4.1)
+* **各算子独立测试**
+  ```bash
+  # 正确性测试
+  cd tests/operator_correctness
+  cd act_dequant_B_ptr/      # 进入对应算子目录
+  python bench.py | tee result.out
 
-- **Goal:** validate that FP8-FLOW-MOE does not degrade convergence compared to BF16.
-- **Entry script:** `tests/convergence_validation/run_convergence.sh <bf16|fp8flowmoe>`
-- **Outputs:** logs are written under `${OUTPUT_DIR}` .
-  Loss curves should be inspected via TensorBoard event files under the run’s log directory, e.g.: `${OUTPUT_DIR}/<run_name>/tensorboard/events.out.tfevents.*`
+  # 性能测试
+  cd tests/operator_benchmarks
+  cd act_dequant_B_ptr/      # 进入对应算子目录
+  python test.py
+  ```
 
-### Experiment group B: End-to-end efficiency evaluation (Section 4.2)
-
-- **Goal:** reproduce throughput (TGS: tokens/GPU/s) and peak memory across precision modes and EP/AC settings.
-- **Entry script:** `tests/e2e_efficiency_evaluation/run_dlc_e2e.sh`
-- **Outputs:** training logs under `${OUTPUT_DIR}` or console; expected reference values in `tests/e2e_efficiency_evaluation/expected_output/expected_results.csv`.
-- **Metrics:** TGS from logs (use stable iters 2–6); peak memory measured externally.
-
-### Experiment group C: End-to-end component ablations (Section 4.3)
-
-- **Goal:** reproduce component ablations on **DeepSeek-V3 (671B)** under the **same setup as Group B** with **AC=full**.
-- **Entry script:** `tests/e2e_component_ablations/run_dlc_e2e.sh`
-- **Outputs:** expected reference values in `tests/e2e_component_ablations/expected_output/expected_results.csv`.
-- **Metrics:** **same as Group B**.
-
-### Experiment group D: Operator-level micro-benchmarks (Section 4.4)
-
-- **Entry points:**
-  - Single-GPU benchmarks: `tests/operator_benchmarks/*/bench.py`
-  - Intra-node communication: `tests/operator_benchmarks/fp8_communication/bench_intranode.py`
-  - Inter-node communication: `tests/operator_benchmarks/fp8_communication/bench_internode.py`
-  - One-click runner & reporter: `tests/operator_benchmarks/run_all_benchmarks.py`
-- **Outputs:**
-  - Per-benchmark `perf_data*.csv`
-  - Aggregated report `operator_benchmarks/validation_report.txt`
-
----
-
-## Evaluation and expected result
-
-This section is a **reproduction/validation checklist**.
-
-> **Feasibility note:** Large-scale end-to-end experiments (Sections 4.2–4.3) require substantial Hopper GPU cluster resources.
-> If reviewers do not have such a cluster, they can still fully evaluate Section 4.4 (operator micro-benchmarks).
-
-### Claim 1: Convergence validation (Section 4.1)
-
-#### A. Inputs
-The script contains cluster-specific paths that must be edited:
-- `TOKENIZER_PATH` — Can be replaced with a public HuggingFace model directory (see [Models](#models))
-- `DATASET_FILE` — The script retains the original internal datasets path. To use mock data instead, set `MOCK_DATASET=true` and `DATASET_FILE=/dev/null` (see [Data sets](#data-sets))
-
-#### B. Run
-```bash
-cd $FP8FLOWMOE_PATH/FP8-FLOW-MOE-AE/tests/convergence_validation
-bash run_convergence.sh <bf16|fp8flowmoe>
-```
-
-#### C. Expected outputs
-Loss is logged via TensorBoard under the run output directory: `${OUTPUT_DIR}/<run_name>/tensorboard/events.out.tfevents.*`
-
-#### D. Expected results & acceptable variation
-A successful reproduction should show stable convergence (no divergence / NaNs), and the **relative loss error remains consistently below 0.25%** (FP8-FLOW-MOE vs BF16) over the compared steps.
-
----
-
-### Claim 2: End-to-end efficiency evaluation (Section 4.2)
-
-#### A. Inputs
-- `CPT_PRETRAIN_CHECKPOINT_PATH` — Megatron-Core format checkpoint (see [Models](#models) for conversion instructions). Can be obtained by converting public HuggingFace weights.
-- `TOKENIZER_PATH` — HuggingFace model directory or converted checkpoint directory containing the tokenizer. Can be replaced with the corresponding public HuggingFace model directory.
-- `DATASET_FILE` — The scripts retain the original internal dataset paths used in the paper. To use mock data instead, set `MOCK_DATASET=true` and `DATASET_FILE=/dev/null` (see [Data sets](#data-sets)).
-
-#### B. Run
-```bash
-cd $FP8FLOWMOE_PATH/FP8-FLOW-MOE-AE/tests/e2e_efficiency_evaluation
-bash run_dlc_e2e.sh <MODEL> <PRECISION> <EP> <AC>
-```
-
-#### C. Expected outputs
-
-**TGS (tokens/GPU/s):** Each run trains for 6 iterations. Use the **best TGS (= minimum elapsed time)** among iterations 2–6.
-
-TGS is calculated from `elapsed time per iteration (ms)` in the log:
-
-```
-TGS = (GBS * SEQ_LEN) / (elapsed_time_ms / 1000) / NUM_GPUS
-```
-
-**Peak memory (GB/GPU):** Not reported in training logs. Measure peak per GPU via your cluster's GPU monitoring system.
-
-#### D. Expected results & acceptable variation
-
-The full set of expected values (Tables 1–6 in the paper) is provided in paper or reference file: 
-`tests/e2e_efficiency_evaluation/expected_output/expected_results.csv`
-
-- Expected qualitative trends match the paper (FP8-FLOW-MOE ≥ BF16 throughput; larger gains at higher EP; selective recomputation enables higher EP without OOM).
-- Acceptable variation: **±15%** deviation in absolute TGS is within normal range due to hardware and network differences across clusters.
-
----
-
-### Claim 3: End-to-end component ablations (Section 4.3)
-
-#### A. Run
-```bash
-cd $FP8FLOWMOE_PATH/FP8-FLOW-MOE-AE/tests/e2e_component_ablations
-bash run_dlc_e2e.sh <perm_pad|double_quant> <ep8|ep16|ep32>
-```
-
-#### B. Expected outputs
-Use **the same method as Claim 2** method.
-
-#### C. Expected results & acceptable variation
-Acceptable variation: same **±15%** as Claim 2.
-
----
-
-### Claim 4: Operator-level micro-benchmarks (Section 4.4)
-
-#### A. Run
-
-**Option 1: one-click (recommended)**
-```bash
-cd $FP8FLOWMOE_PATH/FP8-FLOW-MOE-AE/tests/operator_benchmarks
-python run_all_benchmarks.py                # single-GPU benchmarks only
-python run_all_benchmarks.py --with-comm   # also run FP8 comm benchmark (requires 8 GPUs)
-```
-
-**Option 2: run individual sub-experiments**
-
-Each sub-experiment can also be run independently. After running, use `--report-only` to generate the aggregated report.
-
-```bash
-cd $FP8FLOWMOE_PATH/FP8-FLOW-MOE-AE/tests/operator_benchmarks
-
-# Section 4.4.1 — Fused Permute and Padding (1 GPU)
-cd fused_permute_and_padding && python bench.py && cd ..
-
-# Section 4.4.2 — FP8 Communication, intra-node (8 GPUs)
-cd fp8_communication && python bench_intranode.py && cd ..
-
-# Section 4.4.3 — Fused SwiGLU and Quantization (1 GPU)
-cd fused_swiglu_and_quantization && python bench.py && cd ..
-
-# Section 4.4.4 — Scaling-aware FP8 Transpose (1 GPU)
-cd scaling_aware_fp8_transpose && python bench.py && cd ..
-
-# Generate aggregated report from existing results (without comm results)
-python run_all_benchmarks.py --report-only
-```
-
-#### B. Expected outputs
-- `tests/operator_benchmarks/*/perf_data*.csv`
-- `tests/operator_benchmarks/validation_report.txt` (also printed to console)
-
-#### C. Expected results & acceptable variation
-- Fused operators and FP8 communication should be faster than baselines (speedup > 1) across most tested configurations.
-- Acceptable variation: **±15%** deviation in speedup is acceptable as long as the qualitative conclusion holds.
-
----
-
-## Experiment customization
-
-> **Skip this section if the main experiments in Sections 4.1–4.3 can be reproduced successfully on your cluster.**
-
-**Important caveats:**
-If a multi-node cluster is unavailable for end-to-end efficiency and component ablation experiments (Sections 4.2–4.3), the following single-node smoke tests provide a lightweight alternative using **DeepSeek-V2-Lite (16B)** on **1 node (8 GPUs)**.
-
-| Property | Value |
-|---|---|
-| Model | DeepSeek-V2-Lite (16B) |
-| Hardware required | 1 node, 8 × GPUs |
-| Parallelism | PP=2, EP=4 |
-| Data | Mock data (`MOCK_DATASET=true`); update `TOKENIZER_PATH` to your downloaded DeepSeek-V2-Lite HuggingFace directory (see [Models](#models)) |
-| Purpose | Functional correctness only — verifying that training launches and completes without errors (no NaN/OOM). TGS numbers **cannot** be compared to the paper (different model, EP, batch size, topology) |
-
-### Smoke-test A: End-to-end efficiency (Section 4.2)
-
-```bash
-cd $FP8FLOWMOE_PATH/FP8-FLOW-MOE-AE/tests/e2e_efficiency_evaluation/
-bash run_dsw_DeepSeek-V2-Lite.sh <CASE>
-# CASE: bf16 | blockwise | tensorwise | fp8flowmoe
-```
-
-### Smoke-test B: Component ablations (Section 4.3)
-
-```bash
-cd $FP8FLOWMOE_PATH/FP8-FLOW-MOE-AE/tests/e2e_component_ablations/
-bash run_dsw_DeepSeek-V2-Lite.sh <CASE>
-# CASE: fp8flowmoe | perm_pad | double_quant
-```
-
-## Notes
-
-- The end-to-end scripts contain **cluster-specific** environment settings and absolute paths. AE reviewers should adapt them to their own environment.
-- For best reproducibility, run performance benchmarks on an idle system and keep GPU clocks stable if possible.
+### 3. 结果收集
+* **正确性验证：** 一键测试的结果会保存在 `$TEST_PATH/tests/operator_correctness/test_results_YYYYMMDD_HHMMSS/`，例如：`$TEST_PATH/tests/operator_correctness/test_results_20261021_095046`。若采用各算子独立测试模式，测试结果会在终端输出，也可在算子目录下的 `result.out` 文件中查看。
+* **性能验证：** 一键测试的结果会保存在 `$TEST_PATH/tests/operator_benchmarks/bench_results_YYYYMMDD_HHMMSS/`，例如：`$TEST_PATH/tests/operator_benchmarks/bench_results_20261021_095356`。若采用各算子独立测试模式，测试结果会在终端输出，也可在算子目录下的 `perf_data.csv` 文件中查看。
